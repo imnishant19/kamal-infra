@@ -1,0 +1,115 @@
+name: Pull Request YAML & Kustomize Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate YAML and Kustomize
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for proper commit diffing
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip jq curl
+          pip3 install --user yamllint
+          echo "$HOME/.local/bin" >> $GITHUB_PATH  # Add yamllint to PATH
+
+      - name: Get Changed YAML Files
+        id: changed-files
+        run: |
+          set +e
+          CHANGED_YAML=$(git diff --name-only "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" | grep -E '\.ya?ml$' || echo "")
+          set -e
+
+          if [[ -z "$CHANGED_YAML" ]]; then
+            echo "No YAML files changed."
+            exit 0
+          fi
+
+          echo "CHANGED_YAML<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_YAML" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Validate YAML Files with yamllint
+        if: env.CHANGED_YAML != ''
+        run: |
+          echo "📄 Changed YAML files:"
+          echo "${{ env.CHANGED_YAML }}"
+
+          while IFS= read -r file; do
+            if [[ -f "$file" ]]; then
+              echo "🔍 Validating $file"
+              yamllint --strict -c .yamllint "$file"
+            fi
+          done <<< "${{ env.CHANGED_YAML }}"
+
+      - name: Install Kustomize (ARM)
+        run: |
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | jq -r '.tag_name' | sed 's/^kustomize\///')
+          echo "🔧 Installing Kustomize $LATEST_VERSION for ARM64"
+          curl -Lo kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${LATEST_VERSION}/kustomize_${LATEST_VERSION}_linux_arm64.tar.gz"
+          tar -xzf kustomize.tar.gz
+          chmod +x kustomize
+          sudo mv kustomize /usr/local/bin/
+          rm kustomize.tar.gz
+          echo "✅ Installed $(kustomize version)"
+
+      - name: Get Changed Kustomize Directories
+        id: changed-kustomize-dirs
+        run: |
+          set +e
+          CHANGED_DIRS=$(git diff --name-only "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" | grep 'kustomization.yaml' | xargs -I {} dirname {} | sort | uniq || echo "")
+          set -e
+
+          if [[ -z "$CHANGED_DIRS" ]]; then
+            echo "No Kustomize directories changed."
+            exit 0
+          fi
+
+          echo "KUSTOMIZE_DIRS<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_DIRS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Validate Kustomize Builds
+        if: env.KUSTOMIZE_DIRS != ''
+        run: |
+          echo "📁 Changed Kustomize directories:"
+          echo "${{ env.KUSTOMIZE_DIRS }}"
+
+          while IFS= read -r dir; do
+            if [[ -d "$dir" ]]; then
+              echo "🔨 Building $dir"
+              if ! kustomize build "$dir" > /dev/null; then
+                echo "::error file=$dir/kustomization.yaml::Kustomize build failed in $dir"
+                exit 1
+              fi
+            fi
+          done <<< "${{ env.KUSTOMIZE_DIRS }}"
+
+      - name: Post Validation Summary
+        if: always()
+        run: |
+          echo "### Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.changed-files.outcome }}" == "success" && "${{ env.CHANGED_YAML }}" != '' ]]; then
+            echo "| YAML Validation | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| YAML Validation | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ steps.changed-kustomize-dirs.outcome }}" == "success" && "${{ env.KUSTOMIZE_DIRS }}" != '' ]]; then
+            echo "| Kustomize Build | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Kustomize Build | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
